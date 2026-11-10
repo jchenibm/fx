@@ -26,6 +26,8 @@ const system_prompt =
     "Extract exactly one record for every requested image ID, in requested order.";
 
 pub const Config = struct {
+    /// The provider's own vision model; null asks `image_provider.default_model`.
+    model: ?[]const u8 = null,
     observer: ?*observation.Observer = null,
     parent_call_id: ?[]const u8 = null,
     stream_provider: agent_stream_provider.Provider,
@@ -289,6 +291,7 @@ fn runBatchAttempt(
         user_prompt,
         verified_images,
         .{
+            .model = config.model orelse image_provider.default_model,
             .stream_provider = config.stream_provider,
             .observer = config.observer,
             .parent_call_id = config.parent_call_id,

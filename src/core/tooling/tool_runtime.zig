@@ -1873,6 +1873,7 @@ fn executeVisionRequest(
     authority: command_admission.ToolExecutionAuthority,
 ) !ToolExecutionResult {
     const config: vision_executor.Config = .{
+        .model = state.runtime.provider_capabilities.vision_model,
         .observer = state.runtime.observer,
         .parent_call_id = if (state.runtime.output_chunk_lifecycle_id) |id| id.call_id else null,
         .stream_provider = state.runtime.agent_stream_provider,
