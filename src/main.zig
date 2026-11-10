@@ -5457,6 +5457,7 @@ test {
     _ = @import("core/permissions/direct_command.zig");
     _ = @import("core/permissions/auto_classifier.zig");
     _ = @import("core/permissions/command_admission.zig");
+    _ = @import("core/mcp/features/tools.zig");
     _ = @import("core/mcp/tool_result.zig");
     _ = @import("core/mcp/tool_search.zig");
     _ = @import("core/mcp/http_config.zig");
