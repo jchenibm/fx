@@ -26,12 +26,18 @@ pub const ParseError = Allocator.Error || error{
     InvalidAuth,
     InvalidEnvironmentName,
     InvalidToolChoiceMode,
+    InvalidFinishReasonMode,
     InvalidModelId,
     InvalidModelMetadata,
 };
 
 pub const Protocol = enum { @"openai-chat-completions" };
 pub const ToolChoiceMode = enum { omit, send };
+/// How the stream reducer treats `finish_reason: "stop"` on a reply that also
+/// carries tool calls. Strict follows the OpenAI contract and rejects the mix;
+/// lenient accepts it for OpenAI-compatible gateways (Gemini and others behind
+/// such proxies commonly finish tool-bearing replies with "stop").
+pub const FinishReasonMode = enum { strict, lenient };
 
 /// Describes a credential slot, never a credential value. Resolution belongs at
 /// the effectful edge; `none` must omit Authorization rather than supply a token.
@@ -56,6 +62,7 @@ pub const Definition = struct {
     base_url: []const u8,
     auth: Auth,
     tool_choice_mode: ToolChoiceMode = .omit,
+    finish_reason_mode: FinishReasonMode = .strict,
     reviewer_model: ?[]const u8 = null,
     model_metadata: []const ModelMetadata = &.{},
 
@@ -165,7 +172,7 @@ pub const Registry = struct {
 
 fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) ParseError!Definition {
     try validate_id(id);
-    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "model_metadata" });
+    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "finish_reason_mode", "reviewer_model", "model_metadata" });
     const protocol = try required(value, "protocol");
     if (protocol != .string or !std.mem.eql(u8, protocol.string, "openai-chat-completions")) return error.InvalidProtocol;
     const url = try required(value, "base_url");
@@ -176,6 +183,11 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
     if (value.object.get("tool_choice_mode")) |choice| {
         if (choice != .string) return error.InvalidToolChoiceMode;
         mode = if (std.mem.eql(u8, choice.string, "omit")) .omit else if (std.mem.eql(u8, choice.string, "send")) .send else return error.InvalidToolChoiceMode;
+    }
+    var finish_mode: FinishReasonMode = .strict;
+    if (value.object.get("finish_reason_mode")) |finish| {
+        if (finish != .string) return error.InvalidFinishReasonMode;
+        finish_mode = if (std.mem.eql(u8, finish.string, "strict")) .strict else if (std.mem.eql(u8, finish.string, "lenient")) .lenient else return error.InvalidFinishReasonMode;
     }
     var reviewer: ?[]const u8 = null;
     if (value.object.get("reviewer_model")) |model_value| {
@@ -204,6 +216,7 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
         .base_url = owned_url,
         .auth = owned_auth,
         .tool_choice_mode = mode,
+        .finish_reason_mode = finish_mode,
         .reviewer_model = owned_reviewer,
         .model_metadata = if (value.object.get("model_metadata")) |metadata| try parse_metadata(alloc, metadata) else &.{},
     };
@@ -402,6 +415,21 @@ test "configured provider owns definitions and preserves unknown metadata" {
     try std.testing.expect(unknown.supports_tool_use == null and unknown.supports_vision == null);
     try std.testing.expect(router.model("missing") == null);
     try std.testing.expect(registry.get("Router") == null);
+}
+
+test "configured provider finish reason mode defaults strict and parses lenient" {
+    const alloc = std.testing.allocator;
+    var registry = try Registry.parse_json(alloc,
+        \\{"gateway":{"protocol":"openai-chat-completions","base_url":"https://gw.example/v1","auth":{"type":"bearer","env":"GW_API_KEY"}},
+        \\ "lenient":{"protocol":"openai-chat-completions","base_url":"https://l.example/v1","auth":{"type":"bearer","env":"L_API_KEY"},"finish_reason_mode":"lenient"}}
+    );
+    defer registry.deinit(alloc);
+    try std.testing.expectEqual(FinishReasonMode.strict, registry.get("gateway").?.finish_reason_mode);
+    try std.testing.expectEqual(FinishReasonMode.lenient, registry.get("lenient").?.finish_reason_mode);
+    // The field value is validated, not silently ignored.
+    try std.testing.expectError(error.InvalidFinishReasonMode, Registry.parse_json(alloc,
+        \\{"bad":{"protocol":"openai-chat-completions","base_url":"https://b.example/v1","auth":{"type":"none"},"finish_reason_mode":"loose"}}
+    ));
 }
 
 test "configured provider URL policy and prefix normalization" {

@@ -200,7 +200,7 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
 
         return .{ .failed = .{ .kind = client_mod.httpFailureKind(alloc, .fromHttpStatus(response.head.status), detail), .http_status = response.head.status, .detail = detail, .retry_after_seconds = retry_after, .ownership = .owned } };
     }
-    var result = consume(alloc, reader, request, watch.progress()) catch |err| return watch.failure(err);
+    var result = consumeWithFinishMode(alloc, reader, request, watch.progress(), definition.finish_reason_mode) catch |err| return watch.failure(err);
     if (watch.finish()) |err| {
         result.deinit(alloc);
         return err;
@@ -211,8 +211,15 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
 /// Parses a successful streamed reply from `reader`, telling `progress` about
 /// each event when it is set.
 pub fn consume(alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelRequest, progress: ?sse.Progress) !streams.Result {
+    return consumeWithFinishMode(alloc, reader, request, progress, .strict);
+}
+
+/// `finish_reason_mode` comes from the configured provider definition; strict
+/// keeps the OpenAI contract, lenient accepts "stop" on tool-bearing replies.
+pub fn consumeWithFinishMode(alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelRequest, progress: ?sse.Progress, finish_reason_mode: definitions.FinishReasonMode) !streams.Result {
     var limits: codec.Limits = .{};
     if (request.content_capture_limit) |limit| limits.content_bytes = @min(limit, limits.content_bytes);
+    limits.lenient_finish_reason = finish_reason_mode == .lenient;
     return codec.consume_stream(alloc, reader, request.data(), limits, request.events, request.cancel_flag, progress);
 }
 

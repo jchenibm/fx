@@ -595,6 +595,11 @@ pub const Limits = struct {
     arguments_bytes: usize = 1024 * 1024,
     content_bytes: usize = 8 * 1024 * 1024,
     reasoning_bytes: usize = types.ProviderReplay.max_bytes,
+    /// Accept `finish_reason: "stop"` on a reply that also carries tool calls,
+    /// treating it as a tool-calls finish. Off by default; configured providers
+    /// set it for OpenAI-compatible gateways whose models (Gemini et al.) end
+    /// tool-bearing replies with "stop" instead of "tool_calls".
+    lenient_finish_reason: bool = false,
 };
 
 const ReasoningPart = struct {
@@ -706,17 +711,29 @@ pub const Reducer = struct {
         if (try index_value(choice.get("index") orelse return error.InvalidChunk) != 0) return error.InvalidChunk;
         const delta = try object(choice.get("delta") orelse return error.InvalidChunk);
         if (self.phase == .finished) {
-            const reason = try string(non_null(choice, "finish_reason") orelse return error.InconsistentFinishReason);
-            if (!std.mem.eql(u8, reason, @tagName(self.finish_reason.?))) return error.InconsistentFinishReason;
+            // Trailing chunks after finish_reason. Strict follows the OpenAI
+            // contract: only role/content echoes and a final usage snapshot.
+            // Lenient also tolerates gateways whose usage-only tail chunk
+            // repeats an empty choice without restating finish_reason, or
+            // that vary the reason or attach unexpected trailing delta
+            // fields, as long as no new content or tool calls arrive.
+            const strict = !self.limits.lenient_finish_reason;
+            const reason = non_null(choice, "finish_reason");
+            if (reason) |value| {
+                const text = try string(value);
+                if (strict and !std.mem.eql(u8, text, @tagName(self.finish_reason.?))) return error.InconsistentFinishReason;
+            } else if (strict) return error.InconsistentFinishReason;
             var fields = delta.iterator();
             while (fields.next()) |field| {
                 if (std.mem.eql(u8, field.key_ptr.*, "role")) {
                     if (field.value_ptr.* != .string or !std.mem.eql(u8, field.value_ptr.string, "assistant")) return error.InconsistentFinishReason;
                 } else if (std.mem.eql(u8, field.key_ptr.*, "content")) {
                     if (field.value_ptr.* != .null and (field.value_ptr.* != .string or field.value_ptr.string.len != 0)) return error.InconsistentFinishReason;
-                } else return error.InconsistentFinishReason;
+                } else if (strict) return error.InconsistentFinishReason;
             }
-            try self.accept_usage(non_null(root, "usage") orelse return error.InconsistentFinishReason, true);
+            if (non_null(root, "usage")) |usage| {
+                try self.accept_usage(usage, true);
+            } else if (strict) return error.InconsistentFinishReason;
             return .{};
         }
         if (non_null(delta, "role")) |role| if (!std.mem.eql(u8, try string(role), "assistant")) return error.InvalidChunk;
@@ -918,7 +935,13 @@ pub const Reducer = struct {
         // A cut-off reply may stop anywhere, so only a finished one has to
         // agree with its tool calls.
         if (reason != .length) {
-            if ((reason == .tool_calls) != (self.tools.items.len != 0)) return error.InconsistentFinishReason;
+            if (self.limits.lenient_finish_reason and (reason == .stop) != (self.tools.items.len != 0)) {
+                // Lenient gateways disagree with the OpenAI contract in both
+                // directions: tool-bearing replies finished with "stop", and
+                // tool-less replies finished with "tool_calls". Align the
+                // reported reason with what the stream actually carried.
+                self.finish_reason = if (self.tools.items.len != 0) .tool_calls else .stop;
+            } else if ((reason == .tool_calls) != (self.tools.items.len != 0)) return error.InconsistentFinishReason;
             if (self.choice == .required and self.tools.items.len == 0) return error.RequiredToolMissing;
         }
         // Unadvertised names and invalid arguments are returned as sent. The tool
@@ -963,7 +986,7 @@ pub const Reducer = struct {
         const owned_calls = try calls.toOwnedSlice(self.alloc);
         self.phase = .closed;
         return .{ .completed = .{
-            .completion = .{ .content = content, .tool_calls = owned_calls, .generation_id = generation_id, .finish_reason = reason, .usage = self.usage, .provider_state_json = provider_state },
+            .completion = .{ .content = content, .tool_calls = owned_calls, .generation_id = generation_id, .finish_reason = self.finish_reason.?, .usage = self.usage, .provider_state_json = provider_state },
             .ownership = .owned,
         } };
     }
@@ -2225,6 +2248,45 @@ test "chat completions terminal evidence and finish reasons are strict" {
         const terminal = try alloc.print("{{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{s}\"}}]}}", .{case.reason});
         defer alloc.free(terminal);
         try std.testing.expectError(case.failure, test_finish(&reducer, terminal));
+    }
+    // Lenient gateways finish tool-bearing replies with "stop"; the reducer
+    // then reports the mix as a tool-calls finish instead of rejecting it.
+    {
+        var reducer = try Reducer.init(alloc, test_tool_request(), .{ .lenient_finish_reason = true });
+        defer reducer.deinit();
+        try test_accept(&reducer, test_call);
+        var result = try test_finish(&reducer, test_stop);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(types.ProviderFinishReason.tool_calls, result.completed.completion.finish_reason.?);
+        try std.testing.expectEqual(@as(usize, 1), result.completed.completion.tool_calls.len);
+    }
+    // Lenient also accepts the reverse mix: "tool_calls" finished a reply
+    // that carried none; the reported reason aligns with the stream.
+    {
+        var reducer = try Reducer.init(alloc, test_request(), .{ .lenient_finish_reason = true });
+        defer reducer.deinit();
+        try test_accept(&reducer, test_text);
+        var result = try test_finish(&reducer, test_tools_finish);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(types.ProviderFinishReason.stop, result.completed.completion.finish_reason.?);
+        try std.testing.expectEqual(@as(usize, 0), result.completed.completion.tool_calls.len);
+    }
+    // Strict stays the default: the same mix without the flag still rejects.
+    {
+        var reducer = try Reducer.init(alloc, test_tool_request(), .{});
+        defer reducer.deinit();
+        try test_accept(&reducer, test_call);
+        try std.testing.expectError(error.InconsistentFinishReason, test_finish(&reducer, test_stop));
+    }
+    // Lenient changes nothing for text-only stop replies.
+    {
+        var reducer = try Reducer.init(alloc, test_request(), .{ .lenient_finish_reason = true });
+        defer reducer.deinit();
+        try test_accept(&reducer, test_text);
+        var result = try test_finish(&reducer, test_stop);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(types.ProviderFinishReason.stop, result.completed.completion.finish_reason.?);
+        try std.testing.expectEqual(@as(usize, 0), result.completed.completion.tool_calls.len);
     }
     {
         var reducer = try Reducer.init(alloc, test_request(), .{});
