@@ -4,11 +4,14 @@ import { createHash } from "node:crypto";
 import {
   appendFileSync,
   chmodSync,
+  closeSync,
   copyFileSync,
   cpSync,
   existsSync,
+  ftruncateSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   readdirSync,
   realpathSync,
@@ -277,6 +280,276 @@ async function ask(fixture: Fixture, gateway: any, args: string[]) {
   });
   return result;
 }
+
+/// Runs git in the fixture's workspace with no user or system config.
+function fixtureGit(fixture: Fixture, args: string[], gitDir?: string): string {
+  const result = Bun.spawnSync(
+    ["git", "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", ...(gitDir ? ["--git-dir", gitDir] : []), ...args],
+    { cwd: fixture.workspace, env: { HOME: fixture.home, GIT_CONFIG_NOSYSTEM: "1", PATH: process.env.PATH ?? "/usr/bin:/bin" } },
+  );
+  if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr.toString()}`);
+  return result.stdout.toString().replace(/\n+$/, "");
+}
+
+/// The `workspace_capture` items of a session's log, as their records (D98).
+function workspaceCaptures(fixture: Fixture, id: string): any[] {
+  const text = readFileSync(join(storeRoot(fixture.home), id, "log.jsonl"), "utf8");
+  return text
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .filter((line) => line.kind === "item" && line.type === "workspace_capture")
+    .map((line) => (typeof line.data === "string" ? JSON.parse(line.data) : line.data));
+}
+
+/// The one repository store under `~/.fx/captures`, beside retention's files.
+function captureStore(fixture: Fixture): string {
+  const captures = join(fixture.home, ".fx", "captures");
+  const stores = readdirSync(captures).filter((name) => /^[0-9a-f]{32}$/.test(name));
+  expect(stores.length).toBe(1);
+  return join(captures, stores[0]!, "store.git");
+}
+
+/// A workspace repository with a commit, a tracked edit, an untracked file
+/// and an untracked secret; returns its HEAD.
+function makeCaptureRepository(fixture: Fixture): string {
+  fixtureGit(fixture, ["init", "-q", "-b", "main"]);
+  writeFileSync(join(fixture.workspace, "a.txt"), "one\n");
+  fixtureGit(fixture, ["add", "a.txt"]);
+  fixtureGit(fixture, ["commit", "-q", "-m", "first"]);
+  writeFileSync(join(fixture.workspace, "a.txt"), "two\n");
+  writeFileSync(join(fixture.workspace, "new.txt"), "untracked\n");
+  writeFileSync(join(fixture.workspace, ".env"), "SECRET=1\n");
+  return fixtureGit(fixture, ["rev-parse", "HEAD"]);
+}
+
+function enableWorkspaceCapture(fixture: Fixture) {
+  mkdirSync(join(fixture.home, ".fx"), { recursive: true });
+  writeFileSync(join(fixture.home, ".fx", "settings.json"), JSON.stringify({ experimental: { workspace_capture: true } }));
+}
+
+/// Each turn left a start and an end record of the repository, the secret
+/// left out, and the end tree holding the uncommitted work in fx's store.
+function expectTurnCaptures(fixture: Fixture, id: string, head: string, turns: number) {
+  const records = workspaceCaptures(fixture, id);
+  expect(records.map((record) => record.phase)).toEqual(Array.from({ length: turns }, () => ["start", "end"]).flat());
+  for (const record of records) {
+    expect(record.status).toBe("partial");
+    expect(record.reason).toBe("sensitive");
+    expect(record.head).toBe(head);
+    expect(record.work_tree).toBe(fixture.workspace);
+  }
+  const store = captureStore(fixture);
+  const end = records.at(-1)!;
+  expect(fixtureGit(fixture, ["rev-parse", end.ref], store)).toBe(end.commit);
+  expect(fixtureGit(fixture, ["cat-file", "-p", `${end.tree}:a.txt`], store)).toBe("two");
+  expect(fixtureGit(fixture, ["ls-tree", "--name-only", end.tree], store).split("\n")).not.toContain(".env");
+}
+
+test("fx ask records the repository at each turn's start and end only with experimental.workspace_capture", async () => {
+  const fixture = createFixture("fx-v2-capture-");
+  fixtureGit(fixture, ["init", "-q", "-b", "main"]);
+  writeFileSync(join(fixture.workspace, "a.txt"), "one\n");
+  fixtureGit(fixture, ["add", "a.txt"]);
+  fixtureGit(fixture, ["commit", "-q", "-m", "first"]);
+  const head = fixtureGit(fixture, ["rev-parse", "HEAD"]);
+  writeFileSync(join(fixture.workspace, "a.txt"), "two\n");
+  writeFileSync(join(fixture.workspace, "new.txt"), "untracked\n");
+  writeFileSync(join(fixture.workspace, ".env"), "SECRET=1\n");
+  const indexBefore = readFileSync(join(fixture.workspace, ".git", "index"));
+  const refsBefore = fixtureGit(fixture, ["for-each-ref"]);
+  const gateway = startFakeGateway([fakeGatewayFinalText("CAPTURE_OFF"), fakeGatewayFinalText("CAPTURE_ON")]);
+  try {
+    // Off by default: no item and no store.
+    const off = await ask(fixture, gateway, ["Without captures."]);
+    expect(off.code).toBe(0);
+    expect(workspaceCaptures(fixture, JSON.parse(off.stdout).session_id)).toEqual([]);
+    expect(existsSync(join(fixture.home, ".fx", "captures"))).toBe(false);
+
+    writeFileSync(join(fixture.home, ".fx", "settings.json"), JSON.stringify({ experimental: { workspace_capture: true } }));
+    const on = await ask(fixture, gateway, ["With captures."]);
+    expect(on.code).toBe(0);
+    expect(on.stderr).toBe("");
+    expect(JSON.parse(on.stdout).output).toBe("CAPTURE_ON");
+    const id: string = JSON.parse(on.stdout).session_id;
+    const records = workspaceCaptures(fixture, id);
+    expect(records.map((record) => record.phase)).toEqual(["start", "end"]);
+    // The prompt reached the log before the start capture, so a kill
+    // during the capture keeps it.
+    const kinds = readFileSync(join(storeRoot(fixture.home), id, "log.jsonl"), "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
+      .filter((line) => line.kind === "item")
+      .map((line) => line.type);
+    expect(kinds.indexOf("user")).toBeGreaterThanOrEqual(0);
+    expect(kinds.indexOf("user")).toBeLessThan(kinds.indexOf("workspace_capture"));
+    for (const record of records) {
+      // The secret is left out and named, so the capture is partial.
+      expect(record.status).toBe("partial");
+      expect(record.reason).toBe("sensitive");
+      expect(record.head_state).toBe("commit");
+      expect(record.head).toBe(head);
+      expect(record.work_tree).toBe(fixture.workspace);
+      expect(record.excluded.by_reason.sensitive).toBe(1);
+      expect(record.excluded.sample[0].path).toBe(".env");
+    }
+    // The capture lives in fx's own store and holds the uncommitted work.
+    const store = captureStore(fixture);
+    const end = records[1]!;
+    expect(fixtureGit(fixture, ["rev-parse", end.ref], store)).toBe(end.commit);
+    expect(fixtureGit(fixture, ["cat-file", "-p", `${end.tree}:a.txt`], store)).toBe("two");
+    expect(fixtureGit(fixture, ["cat-file", "-p", `${end.tree}:new.txt`], store)).toBe("untracked");
+    expect(fixtureGit(fixture, ["ls-tree", "--name-only", end.tree], store).split("\n")).not.toContain(".env");
+    // The user's repository is untouched.
+    expect(readFileSync(join(fixture.workspace, ".git", "index")).equals(indexBefore)).toBe(true);
+    expect(fixtureGit(fixture, ["for-each-ref"])).toBe(refsBefore);
+    expect(fixtureGit(fixture, ["status", "--porcelain"]).split("\n").sort()).toEqual([" M a.txt", "?? .env", "?? new.txt"]);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT);
+
+test("fx ask captures another repository a tool writes in before the write, with experimental.workspace_capture", async () => {
+  const fixture = createFixture("fx-v2-capture-reach-");
+  makeCaptureRepository(fixture);
+  enableWorkspaceCapture(fixture);
+  // A second repository outside the session's folder.
+  const other = join(fixture.root, "other");
+  mkdirSync(other, { recursive: true });
+  const otherGit = (...args: string[]) => {
+    const result = Bun.spawnSync(["git", "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", ...args], {
+      cwd: other,
+      env: { HOME: fixture.home, GIT_CONFIG_NOSYSTEM: "1", PATH: process.env.PATH ?? "/usr/bin:/bin" },
+    });
+    if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr.toString()}`);
+    return result.stdout.toString().replace(/\n+$/, "");
+  };
+  otherGit("init", "-q", "-b", "main");
+  writeFileSync(join(other, "base.txt"), "base\n");
+  otherGit("add", "base.txt");
+  otherGit("commit", "-q", "-m", "base");
+  const target = join(other, "made.txt");
+  const gateway = startDynamicFakeGateway((body) => {
+    if (body.includes("reach-write")) return fakeGatewayFinalText("REACHED");
+    return fakeGatewayToolCall("reach-write", "write_file", { path: target, content: "made\n" });
+  }, { classifierDecision: "clear" });
+  try {
+    const result = await ask(fixture, gateway, ["Write in the other repository."]);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("REACHED");
+    expect(readFileSync(target, "utf8")).toBe("made\n");
+    const records = workspaceCaptures(fixture, JSON.parse(result.stdout).session_id);
+    const otherRoot = realpathSync(other);
+    expect(records.map((record) => [record.phase, record.work_tree, record.trigger_tool])).toEqual([
+      ["start", fixture.workspace, null],
+      ["start", otherRoot, "write_file"],
+      ["end", fixture.workspace, null],
+      ["end", otherRoot, null],
+    ]);
+    // The other repository's start capture came before the write; its end
+    // capture holds the file.
+    const otherRecords = records.filter((record) => record.work_tree === otherRoot);
+    const captures = join(fixture.home, ".fx", "captures");
+    const store = readdirSync(captures)
+      .filter((name) => /^[0-9a-f]{32}$/.test(name))
+      .map((name) => join(captures, name, "store.git"))
+      .find((candidate) => Bun.spawnSync(["git", "--git-dir", candidate, "rev-parse", "-q", "--verify", otherRecords[0].ref]).exitCode === 0)!;
+    const names = (tree: string) => fixtureGit(fixture, ["ls-tree", "--name-only", tree], store).split("\n");
+    expect(names(otherRecords[0].tree)).toEqual(["base.txt"]);
+    expect(names(otherRecords[1].tree).sort()).toEqual(["base.txt", "made.txt"]);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT);
+
+test("fx ask never captures a repository at the home folder that a tool writes in, with experimental.workspace_capture", async () => {
+  const fixture = createFixture("fx-v2-capture-home-");
+  makeCaptureRepository(fixture);
+  enableWorkspaceCapture(fixture);
+  // The home folder kept as a dotfiles repository.
+  const homeGit = (...args: string[]) => {
+    const result = Bun.spawnSync(["git", "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", ...args], {
+      cwd: fixture.home,
+      env: { HOME: fixture.home, GIT_CONFIG_NOSYSTEM: "1", PATH: process.env.PATH ?? "/usr/bin:/bin" },
+    });
+    if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr.toString()}`);
+  };
+  homeGit("init", "-q", "-b", "main");
+  writeFileSync(join(fixture.home, ".profile"), "export A=1\n");
+  homeGit("add", ".profile");
+  homeGit("commit", "-q", "-m", "dotfiles");
+  const target = join(fixture.home, "notes.txt");
+  const trace = join(fixture.root, "home.trace.log");
+  const gateway = startDynamicFakeGateway((body) => {
+    if (body.includes("home-write")) return fakeGatewayFinalText("HOME_WRITTEN");
+    return fakeGatewayToolCall("home-write", "write_file", { path: target, content: "private\n" });
+  }, { classifierDecision: "clear" });
+  try {
+    const result = await runFx(["ask", "--json", "--auto", "Write a note in my home folder."], {
+      cwd: fixture.workspace,
+      env: { ...env(fixture, gateway), FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "workspace" },
+      timeoutMs: TIMEOUT,
+    });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("HOME_WRITTEN");
+    expect(readFileSync(target, "utf8")).toBe("private\n");
+    const records = workspaceCaptures(fixture, JSON.parse(result.stdout).session_id);
+    expect(records.map((record) => [record.phase, record.work_tree])).toEqual([
+      ["start", fixture.workspace],
+      ["end", fixture.workspace],
+    ]);
+    expect(readFileSync(trace, "utf8")).toMatch(/event=workspace_capture_reach_skipped session=\S+ tool=write_file reason=private_root/);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT);
+
+test("fx ask records a budget refusal and writes nothing while the captures folder is over its budget", async () => {
+  const fixture = createFixture("fx-v2-capture-budget-");
+  makeCaptureRepository(fixture);
+  enableWorkspaceCapture(fixture);
+  const gateway = startFakeGateway([fakeGatewayFinalText("WITHIN_BUDGET"), fakeGatewayFinalText("OVER_BUDGET")]);
+  try {
+    const first = await ask(fixture, gateway, ["Within the budget."]);
+    expect(first.code).toBe(0);
+    const firstRecords = workspaceCaptures(fixture, JSON.parse(first.stdout).session_id);
+    expect(firstRecords.map((record) => record.status)).toEqual(["partial", "partial"]);
+    const captures = join(fixture.home, ".fx", "captures");
+    const store = captureStore(fixture);
+    const refsBefore = fixtureGit(fixture, ["for-each-ref"], store);
+
+    // A sparse file beside the stores counts at its full size and takes no
+    // disk, so the profile is 6 GiB, over its 5 GiB budget. Maintenance
+    // evicts the earlier session, which is neither current nor open, and
+    // the profile is still over, so the new turn's captures are refused.
+    const ballast = openSync(join(captures, "ballast"), "w");
+    ftruncateSync(ballast, 6 * 1024 ** 3);
+    closeSync(ballast);
+    const over = await ask(fixture, gateway, ["Over the budget."]);
+    expect(over.code).toBe(0);
+    expect(over.stderr).toBe("");
+    expect(JSON.parse(over.stdout).output).toBe("OVER_BUDGET");
+    const records = workspaceCaptures(fixture, JSON.parse(over.stdout).session_id);
+    expect(records.map((record) => [record.phase, record.status, record.reason])).toEqual([
+      ["start", "unavailable", "budget"],
+      ["end", "unavailable", "budget"],
+    ]);
+    expect(refsBefore).not.toBe("");
+    expect(fixtureGit(fixture, ["for-each-ref"], store)).toBe("");
+    const journal = readFileSync(join(captures, "evictions.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    expect(journal.map((entry) => entry.phase)).toEqual(["intent", "done"]);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT);
 
 test("fx ask saves to v2, resumes by id and by last, and never writes v1", async () => {
   const fixture = createFixture("fx-v2-ask-");
@@ -2369,6 +2642,60 @@ function acpPrompt(text: string) {
   return { prompt: [{ type: "text", text }] };
 }
 
+test.skipIf(!tmuxAvailable())("the app records the repository at each turn's start and end with experimental.workspace_capture", async () => {
+  const fixture = createFixture("fx-v2-app-capture-");
+  const head = makeCaptureRepository(fixture);
+  enableWorkspaceCapture(fixture);
+  const gateway = replyToLatest([["Capture this app turn.", "APP_CAPTURED"]]);
+  const trace = join(fixture.root, "app-capture.trace.log");
+  try {
+    const app = await startApp(fixture, gateway, [], true, { FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "workspace" });
+    await app.session.sendText("Capture this app turn.");
+    await app.session.waitForText("APP_CAPTURED", TIMEOUT);
+    const id = onlySessionId(fixture.home);
+    await waitForLog(fixture, id, "turn_committed");
+    await quitApp(app);
+    expectTurnCaptures(fixture, id, head, 1);
+    // The end capture ran on the agent's worker before the UI's commit,
+    // which only wrote what was held.
+    const text = readFileSync(trace, "utf8");
+    const ended = text.match(/event=workspace_capture_end session=\S+ reached=\d+ thread=(\d+)/);
+    const commit = text.match(/event=workspace_capture_commit session=\S+ held=(\w+) thread=(\d+)/);
+    expect(ended).not.toBeNull();
+    expect(commit).not.toBeNull();
+    expect(commit![1]).toBe("true");
+    expect(ended![1]).not.toBe(commit![2]);
+    expect(text.indexOf("event=workspace_capture_end")).toBeLessThan(text.indexOf("event=workspace_capture_commit"));
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
+test("ACP records the repository at each turn's start and end with experimental.workspace_capture", async () => {
+  const fixture = createFixture("fx-v2-acp-capture-");
+  const head = makeCaptureRepository(fixture);
+  enableWorkspaceCapture(fixture);
+  const gateway = replyToLatest([
+    ["First captured ACP question.", "ACP_CAPTURED_ONE"],
+    ["Second captured ACP question.", "ACP_CAPTURED_TWO"],
+  ]);
+  let client: AcpRpc | undefined;
+  try {
+    client = await AcpRpc.start(fixture, gateway);
+    const id = (await client.ok("session/new", { cwd: fixture.workspace, mcpServers: [] })).sessionId;
+    expect((await client.ok("session/prompt", { sessionId: id, ...acpPrompt("First captured ACP question.") })).stopReason).toBe("end_turn");
+    expect((await client.ok("session/prompt", { sessionId: id, ...acpPrompt("Second captured ACP question.") })).stopReason).toBe("end_turn");
+    expect(await client.close()).toBe(0);
+    client = undefined;
+    expectTurnCaptures(fixture, id, head, 2);
+  } finally {
+    if (client) await client.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
 test("ACP keeps a session once prompted, lists it, and loads every turn after a restart", async () => {
   const fixture = createFixture("fx-v2-acp-");
   const gateway = replyToLatest([
@@ -3116,6 +3443,95 @@ test("a crash while a named subagent works records it interrupted, and its next 
   }
 }, TIMEOUT * 3);
 
+
+/// A subagent's own session holds a start and an end capture of each of its
+/// turns, beside its parent's.
+function expectChildCaptures(fixture: Fixture, parentId: string, head: string) {
+  const lines = childLines(fixture.home, parentId);
+  const childId = lines[0].child;
+  const records = workspaceCaptures(fixture, childId);
+  expect(records.map((record) => record.phase)).toEqual(["start", "end"]);
+  for (const record of records) {
+    expect(record.status).toBe("partial");
+    expect(record.reason).toBe("sensitive");
+    expect(record.head).toBe(head);
+  }
+  expect(workspaceCaptures(fixture, parentId).length).toBeGreaterThanOrEqual(2);
+  expectWholeLog(fixture, childId);
+}
+
+test("fx ask records a subagent's repository in its own session with experimental.workspace_capture", async () => {
+  const fixture = createFixture("fx-v2-subagent-capture-");
+  const head = makeCaptureRepository(fixture);
+  enableWorkspaceCapture(fixture);
+  const gateway = startDynamicFakeGateway((body) => {
+    if (isChildRequest(body)) return fakeGatewayFinalText("CHILD_CAPTURED");
+    if (isReportTurn(body)) return fakeGatewayFinalText("PARENT_DONE");
+    if (body.includes("delegate-capture")) return fakeGatewayFinalText("PARENT_SENT");
+    return fakeGatewayToolCall("delegate-capture", "subagent", { request: { action: "message", agent: "marker", message: "Report the child marker." } });
+  }, { classifierDecision: "clear" });
+  try {
+    const result = await ask(fixture, gateway, ["Delegate with captures."]);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("PARENT_DONE");
+    expectChildCaptures(fixture, JSON.parse(result.stdout).session_id, head);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
+test.skipIf(!tmuxAvailable())("the app records a subagent's repository in its own session with experimental.workspace_capture", async () => {
+  const fixture = createFixture("fx-v2-app-subagent-capture-");
+  const head = makeCaptureRepository(fixture);
+  enableWorkspaceCapture(fixture);
+  const gateway = startDynamicFakeGateway((body) => {
+    if (isAppChildRequest(body, ["Delegate with captures from the app."])) return fakeGatewayFinalText("APP_CHILD_CAPTURED");
+    if (isReportTurn(body)) return fakeGatewayFinalText("APP_PARENT_DONE");
+    if (body.includes("app-delegate-capture")) return fakeGatewayFinalText("APP_PARENT_SENT");
+    return fakeGatewayToolCall("app-delegate-capture", "subagent", { request: { action: "message", agent: "reporter", message: "Report from the app child." } });
+  }, { classifierDecision: "clear" });
+  try {
+    const app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "auto" });
+    await app.session.sendText("Delegate with captures from the app.");
+    await scrollbackContains(app.session, "APP_PARENT_DONE");
+    await app.session.waitForComposer(TIMEOUT);
+    await quitApp(app);
+    const roots = rootSessionIds(fixture.home);
+    expect(roots).toHaveLength(1);
+    expectChildCaptures(fixture, roots[0]!, head);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("ACP records a subagent's repository in its own session with experimental.workspace_capture", async () => {
+  const fixture = createFixture("fx-v2-acp-subagent-capture-");
+  const head = makeCaptureRepository(fixture);
+  enableWorkspaceCapture(fixture);
+  const gateway = startDynamicFakeGateway((body) => {
+    if (isChildRequest(body)) return fakeGatewayFinalText("ACP_CHILD_CAPTURED");
+    if (isReportTurn(body)) return fakeGatewayFinalText("ACP_PARENT_DONE");
+    if (body.includes("acp-delegate-capture")) return fakeGatewayFinalText("ACP_PARENT_SENT");
+    return fakeGatewayToolCall("acp-delegate-capture", "subagent", { request: { action: "message", agent: "reporter", message: "Report from the ACP child." } });
+  }, { classifierDecision: "clear" });
+  let client: AcpRpc | undefined;
+  try {
+    client = await AcpRpc.start(fixture, gateway);
+    const id = (await client.ok("session/new", { cwd: fixture.workspace, mcpServers: [] })).sessionId;
+    expect((await client.ok("session/prompt", { sessionId: id, ...acpPrompt("Delegate with captures over ACP.") })).stopReason).toBe("end_turn");
+    // The report starts the parent's next turn on its own; wait for it.
+    for (let attempt = 0; attempt < 100 && !JSON.stringify(logLines(fixture.home, id)).includes("ACP_PARENT_DONE"); attempt += 1) await Bun.sleep(100);
+    expect(await client.close()).toBe(0);
+    client = undefined;
+    expectChildCaptures(fixture, id, head);
+  } finally {
+    if (client) await client.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
 
 test.skipIf(!tmuxAvailable())("the interactive app runs a subagent on v2 and records it in the session's log", async () => {
   const fixture = createFixture("fx-v2-app-subagent-");

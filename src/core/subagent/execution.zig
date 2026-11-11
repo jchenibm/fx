@@ -14,6 +14,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const session = @import("../session/session.zig");
 const session_adapter = @import("../session/session_adapter.zig");
+const turn_capture = @import("../workspace/turn_capture.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 const session_codec = @import("../session/session_codec.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
@@ -315,6 +316,14 @@ pub const TurnContext = struct {
     /// Borrowed from the subagent host for the turn.
     failure_diagnostic: ?types.ModelFailureDiagnostic = null,
     committed: bool = false,
+    /// Where the child's workspace captures go while
+    /// `experimental.workspace_capture` is on; null when it is off. A hosted
+    /// run's own agent captures instead (D98).
+    workspace_capture: ?turn_capture.Target = null,
+    turn_capture: turn_capture.TurnCapture = .{},
+    /// Orders capture saves with each other; the child's commits run on the
+    /// turn's own thread.
+    capture_lock: std.Io.Mutex = .init,
 
     /// A turn over a child, restored from its log.
     pub fn init(
@@ -350,6 +359,34 @@ pub const TurnContext = struct {
             .managed_executions = managed_execution.Runtime.init(alloc),
             .child = null,
         };
+    }
+
+    fn workspaceCaptureContext(self: *TurnContext) ?turn_capture.Context {
+        if (comptime !turn_capture.supported) return null;
+        const target = self.workspace_capture orelse return null;
+        return target.context(self.child orelse return null);
+    }
+
+    /// Whether the child's turns capture its workspace.
+    pub fn capturesWorkspace(self: *TurnContext) bool {
+        return self.workspaceCaptureContext() != null;
+    }
+
+    /// The child's turn starts: its start capture (D98).
+    pub fn startWorkspaceCapture(self: *TurnContext, fresh: bool, step: runtime_deps.AgentRuntimeDeps.WorkspaceCaptureStep) void {
+        if (comptime !turn_capture.supported) return;
+        const context = self.workspaceCaptureContext() orelse return;
+        switch (step) {
+            .begin => self.turn_capture.begin(context, fresh),
+            .capture => self.turn_capture.start(context, &self.capture_lock),
+        }
+    }
+
+    /// A child's tool is about to act in `dir` (D98).
+    pub fn reachWorkspace(self: *TurnContext, dir: []const u8, tool_name: []const u8) void {
+        if (comptime !turn_capture.supported) return;
+        const context = self.workspaceCaptureContext() orelse return;
+        self.turn_capture.reach(context, dir, tool_name, &self.capture_lock);
     }
 
     /// True when the child's own agent holds the session.
@@ -600,8 +637,19 @@ pub const TurnContext = struct {
         defer if (prepared_owned) session.freeHistoryTurn(self.alloc, prepared);
         // The work id rides on the turn.
         const child = self.child orelse return error.SessionCommitFailed;
+        // The repository as the child's turn left it, saved with the commit
+        // that uses the turn's token.
+        if (comptime turn_capture.supported) {
+            if (self.workspaceCaptureContext()) |context| self.turn_capture.end(context, &self.capture_lock);
+        }
         child.prepareTurn(&prepared) catch |err| return commitFailed(child, work_id, "prepare", err);
-        child.commitTurn(prepared, self.runtime.languageSnapshot()) catch |err| return commitFailed(child, work_id, "commit", err);
+        const capture_token = self.turn_capture.token();
+        const committed = if (capture_token) |token|
+            child.commitTurnWithCaptures(prepared, self.runtime.languageSnapshot(), token)
+        else
+            child.commitTurn(prepared, self.runtime.languageSnapshot());
+        committed catch |err| return commitFailed(child, work_id, "commit", err);
+        self.turn_capture.committed(capture_token);
         self.runtime.commitPreparedHistoryEntry(self.alloc, prepared);
         prepared_owned = false;
     }

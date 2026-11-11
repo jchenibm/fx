@@ -67,6 +67,7 @@ const command_replay_store = @import("../session/command_replay_store.zig");
 const session_codec = @import("../session/session_codec.zig");
 const session_store = @import("../session/session_store.zig");
 const session_adapter = @import("../session/session_adapter.zig");
+const turn_capture = @import("../workspace/turn_capture.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
@@ -304,6 +305,7 @@ fn runAskChild(
         .context_enabled = ctx.context_enabled,
         .project_context = ctx.modelVisibleProjectContext(),
         .lifecycle_view = ctx.lifecycle_view,
+        .workspace_capture = if (ctx.workspaceCaptureContext()) |context| .{ .home = context.home, .path = context.path } else null,
     }, turn, message, admission, cancel);
 }
 
@@ -660,6 +662,10 @@ const AskContext = struct {
     /// A resumed v2 session's preferences; `model` borrows from here.
     v2_preferences: ?session_codec.DurableSessionPreferences = null,
     session_write_mutex: std.Io.Mutex = .init,
+    /// `experimental.workspace_capture`, from startup.
+    workspace_capture: bool = false,
+    /// This run's turn captures, when `workspace_capture` is on (D98).
+    turn_capture: turn_capture.TurnCapture = .{},
     requested_resume: ?ResumeTarget = null,
     seed_model: []const u8 = "",
     command_timeout_ms: ?usize = null,
@@ -900,6 +906,15 @@ const AskContext = struct {
     }
 
     /// The saved session's id.
+    /// What a workspace capture needs, or null when captures are off or
+    /// the run saves no session.
+    fn workspaceCaptureContext(self: *const AskContext) ?turn_capture.Context {
+        if (!self.workspace_capture) return null;
+        const v2 = self.v2 orelse return null;
+        const store = self.v2_store orelse return null;
+        return .{ .session = v2, .home = store.home, .path = self.workspace_root, .alloc = std.heap.c_allocator };
+    }
+
     fn activeSessionId(self: *const AskContext) ?[]const u8 {
         return if (self.v2) |v2| v2.id() else null;
     }
@@ -1694,6 +1709,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         startup.notification_turn_end,
         startup.notification_attention_required,
     );
+    ctx.workspace_capture = startup.workspace_capture;
     ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
     if (options.save_session) {
         try ctx.checkCancellation();
@@ -2164,6 +2180,8 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .append_turn_piece = if (ctx.v2 != null) appendTurnPiece else null,
         .record_usage = if (ctx.v2 != null) recordUsage else null,
         .save_prompt_images = if (ctx.v2 != null) savePromptImages else null,
+        .start_workspace_capture = if (ctx.workspaceCaptureContext() != null) startWorkspaceCapture else null,
+        .reach_workspace = if (ctx.workspaceCaptureContext() != null) reachWorkspace else null,
         .propagate_grant = propagateGrant,
         .push_event = pushEvent,
         .push_text = pushText,
@@ -3053,15 +3071,23 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
     var prepared = try ctx.session.prepareHistoryEntry(ctx.alloc, turn);
     var prepared_owned = true;
     defer if (prepared_owned) types.freeHistoryTurn(ctx.alloc, prepared);
+    // The repository as the turn left it, captured before the write lock.
+    if (ctx.workspaceCaptureContext()) |context| ctx.turn_capture.end(context, &ctx.session_write_mutex);
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
     if (ctx.v2) |v2| {
         try v2.prepareTurn(&prepared);
-        v2.commitTurn(prepared, ctx.session.languageSnapshot()) catch |err| {
+        const capture_token = ctx.turn_capture.token();
+        const committed = if (capture_token) |token|
+            v2.commitTurnWithCaptures(prepared, ctx.session.languageSnapshot(), token)
+        else
+            v2.commitTurn(prepared, ctx.session.languageSnapshot());
+        committed catch |err| {
             // A failed write may still have reached the log: keep its images.
             if (session_adapter.writeMayHaveLanded(err)) ctx.prompt_snapshot_committed = true;
             return err;
         };
+        ctx.turn_capture.committed(capture_token);
         ctx.session.commitPreparedHistoryEntry(ctx.alloc, prepared);
         prepared_owned = false;
         ctx.prompt_snapshot_committed = true;
@@ -3127,6 +3153,21 @@ fn savePromptImages(raw_ctx: *anyopaque, alloc: std.mem.Allocator, images: []typ
     v2.savePromptImages(alloc, images) catch |err| {
         debug_trace.logf("session", "event=sessions_v2_prompt_images_inline session={s} err={s}", .{ v2.id(), @errorName(err) });
     };
+}
+
+fn startWorkspaceCapture(raw_ctx: *anyopaque, fresh: bool, step: agent_runtime.AgentRuntimeDeps.WorkspaceCaptureStep) void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    const context = ctx.workspaceCaptureContext() orelse return;
+    switch (step) {
+        .begin => ctx.turn_capture.begin(context, fresh),
+        .capture => ctx.turn_capture.start(context, &ctx.session_write_mutex),
+    }
+}
+
+fn reachWorkspace(raw_ctx: *anyopaque, dir: []const u8, tool_name: []const u8) void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    const context = ctx.workspaceCaptureContext() orelse return;
+    ctx.turn_capture.reach(context, dir, tool_name, &ctx.session_write_mutex);
 }
 
 fn propagateGrant(_: *anyopaque, _: []const u8, _: []const u8) !void {}

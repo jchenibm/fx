@@ -47,6 +47,7 @@ const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const session_title_generation = @import("../session/session_title_generation.zig");
 const session_adapter = @import("../session/session_adapter.zig");
+const turn_capture = @import("../workspace/turn_capture.zig");
 const session_store = @import("../session/session_store.zig");
 const session_catalog_cache = @import("../session/session_catalog_cache.zig");
 const session_summary_codec = @import("../session/session_summary_codec.zig");
@@ -1519,6 +1520,10 @@ pub fn Runtime(comptime App: type) type {
             });
             var fork_owned = true;
             errdefer if (fork_owned) fork.close();
+            // The fork keeps the source's captures from retention (D98).
+            if (comptime turn_capture.supported) {
+                if (agent.session_persistence.workspace_capture) turn_capture.copyForkCaptures(fork.store.home, source_id, fork, copies);
+            }
             try app.prepareLiveSessionResume(agent);
             fork_owned = false;
             try installResumedV2Session(app, agent, fork, .{ .fork = source_id });
@@ -1615,6 +1620,8 @@ pub fn Runtime(comptime App: type) type {
             var resumed = try v2.durableState(app.alloc, app.workspace_root);
             defer resumed.deinit(app.alloc);
             agent.session_persistence.v2 = v2;
+            // A subagent captures its own turns as the first agent does (D98).
+            agent.session_persistence.workspace_capture = app.main_agent.session_persistence.workspace_capture;
             v2_owned = false;
             errdefer {
                 agent.session_persistence.v2 = null;
@@ -2282,6 +2289,9 @@ pub fn Runtime(comptime App: type) type {
                 commitJsHostSnapshot(app, agent, "history_turn");
                 return .committed;
             }
+            // The turn's end capture was taken on its worker as the turn
+            // finished (`endWorkspaceCapture`); this commit, which may run on
+            // the UI thread, only writes what is held, and a retry reuses it.
             agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             if (agent.session_persistence.v2) |v2| {
                 defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
@@ -2321,7 +2331,17 @@ pub fn Runtime(comptime App: type) type {
         ) !?HistoryAppendOutcome {
             const failure: anyerror = saved: {
                 v2.prepareTurn(prepared) catch |err| break :saved err;
-                v2.commitTurn(prepared.*, agent.session.languageSnapshot()) catch |err| break :saved err;
+                const captures = &agent.session_persistence.turn_capture;
+                const capture_token = captures.token();
+                if (comptime turn_capture.supported) {
+                    if (agent.session_persistence.workspace_capture) debug_trace.logf("workspace", "event=workspace_capture_commit session={s} held={} thread={d}", .{ v2.id(), capture_token != null, std.Thread.getCurrentId() });
+                }
+                const committed = if (capture_token) |token|
+                    v2.commitTurnWithCaptures(prepared.*, agent.session.languageSnapshot(), token)
+                else
+                    v2.commitTurn(prepared.*, agent.session.languageSnapshot());
+                committed catch |err| break :saved err;
+                captures.committed(capture_token);
                 return null;
             };
             switch (mode) {
@@ -2362,6 +2382,43 @@ pub fn Runtime(comptime App: type) type {
             defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
             const v2 = agent.session_persistence.v2 orelse return;
             try v2.recordUsage(usage);
+        }
+
+        /// What a workspace capture of `agent`'s session needs, or null when
+        /// captures are off or the session is not saved.
+        fn workspaceCaptureContext(app: *App, agent: *AppAgent) ?turn_capture.Context {
+            if (comptime !@hasField(App, "workspace_root")) return null;
+            const persistence = &agent.session_persistence;
+            if (!persistence.workspace_capture) return null;
+            const v2 = persistence.v2 orelse return null;
+            // The session's own store: a subagent's agent has no `v2_store`.
+            return .{ .session = v2, .home = v2.store.home, .path = app.workspace_root, .alloc = std.heap.c_allocator };
+        }
+
+        /// `AgentRuntimeDeps.reach_workspace` on v2 (D98).
+        pub fn reachWorkspace(app: *App, agent: *AppAgent, dir: []const u8, tool_name: []const u8) void {
+            const context = workspaceCaptureContext(app, agent) orelse return;
+            agent.session_persistence.turn_capture.reach(context, dir, tool_name, &agent.session_persistence.write_mutex);
+        }
+
+        /// `AgentRuntimeDeps.start_workspace_capture` on v2 (D98).
+        pub fn startWorkspaceCapture(app: *App, agent: *AppAgent, fresh: bool, step: agent_runtime.AgentRuntimeDeps.WorkspaceCaptureStep) void {
+            const context = workspaceCaptureContext(app, agent) orelse return;
+            const captures = &agent.session_persistence.turn_capture;
+            switch (step) {
+                .begin => captures.begin(context, fresh),
+                .capture => captures.start(context, &agent.session_persistence.write_mutex),
+            }
+        }
+
+        /// The repository as the turn left it, taken on the agent's worker
+        /// as its turn finishes and before the finished prompt reaches the
+        /// UI, whose commit writes it (D98). A capture can take seconds, so
+        /// it never runs on the UI thread.
+        pub fn endWorkspaceCapture(app: *App, agent: *AppAgent) void {
+            if (comptime !turn_capture.supported) return;
+            const context = workspaceCaptureContext(app, agent) orelse return;
+            agent.session_persistence.turn_capture.end(context, &agent.session_persistence.write_mutex);
         }
 
         /// `AgentRuntimeDeps.save_prompt_images` on v2: the prompt's images

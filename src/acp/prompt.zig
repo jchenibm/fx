@@ -49,6 +49,7 @@ const session_codec = @import("../core/session/session_codec.zig");
 const session_log = @import("../core/session/session_log.zig");
 const session_store = @import("../core/session/session_store.zig");
 const session_adapter = @import("../core/session/session_adapter.zig");
+const turn_capture = @import("../core/workspace/turn_capture.zig");
 const libfx_journal = @import("libfx_journal.zig");
 const journal_events = @import("../core/agent/runtime/journal.zig");
 const libfx_steering = @import("libfx_steering.zig");
@@ -1358,6 +1359,7 @@ pub fn runSubagentChild(
         .context_enabled = state.context_enabled,
         .project_context = state.context_snapshot.modelVisibleBytes(),
         .lifecycle_view = state.lifecycle_view,
+        .workspace_capture = childCaptureTarget(state),
     }, turn, message, admission, cancel);
 }
 
@@ -1933,6 +1935,12 @@ fn acpCacheWarmer(state: *server.ServerState, session: *server.ActiveSessionStat
 
 fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
     const session = if (ctx.state.active_session) |*active| active else unreachable;
+    session.capture_home = if (!ctx.state.workspace_capture)
+        null
+    else if (server.sessionsStore(ctx.state)) |store|
+        store.home
+    else
+        null;
     return .{
         .ctx = @ptrCast(ctx),
         .observer = ctx.observer,
@@ -1975,6 +1983,8 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .record_usage = if (session.v2 != null) recordUsage else null,
         .cache_warmer = acpCacheWarmer(ctx.state, session),
         .save_prompt_images = if (session.v2 != null) savePromptImages else null,
+        .start_workspace_capture = if (comptime !turn_capture.supported) null else if (session.v2 != null and session.capture_home != null) startWorkspaceCapture else null,
+        .reach_workspace = if (comptime !turn_capture.supported) null else if (session.v2 != null and session.capture_home != null) reachWorkspace else null,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
         .recovery_checkpoint = if (session.journal != null)
             .{
@@ -2852,6 +2862,41 @@ fn recordUsage(raw_ctx: *anyopaque, usage: types.Usage) !void {
 /// the session's blobs before its first request (D89). A failure leaves the
 /// rest inline, with no path, as the adapter does for one image the store
 /// refuses.
+/// Where a subagent's captures go: the store's home and the active
+/// session's folder, while captures are on.
+fn childCaptureTarget(state: *server.ServerState) ?turn_capture.Target {
+    if (comptime !turn_capture.supported) return null;
+    if (!state.workspace_capture) return null;
+    const store = server.sessionsStore(state) orelse return null;
+    const path = if (state.active_session) |*active| active.workspace_root else state.workspace_root;
+    return .{ .home = store.home, .path = path };
+}
+
+/// What a workspace capture of `session` needs, or null when captures are
+/// off or the session is not saved.
+fn workspaceCaptureContext(session: *server.ActiveSessionState) ?turn_capture.Context {
+    const v2 = session.v2 orelse return null;
+    const home = session.capture_home orelse return null;
+    return .{ .session = v2, .home = home, .path = session.workspace_root, .alloc = std.heap.c_allocator };
+}
+
+fn startWorkspaceCapture(raw_ctx: *anyopaque, fresh: bool, step: agent_runtime.AgentRuntimeDeps.WorkspaceCaptureStep) void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const session = if (ctx.state.active_session) |*value| value else return;
+    const context = workspaceCaptureContext(session) orelse return;
+    switch (step) {
+        .begin => session.turn_capture.begin(context, fresh),
+        .capture => session.turn_capture.start(context, &session.session_write_mutex),
+    }
+}
+
+fn reachWorkspace(raw_ctx: *anyopaque, dir: []const u8, tool_name: []const u8) void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const session = if (ctx.state.active_session) |*value| value else return;
+    const context = workspaceCaptureContext(session) orelse return;
+    session.turn_capture.reach(context, dir, tool_name, &session.session_write_mutex);
+}
+
 fn savePromptImages(raw_ctx: *anyopaque, alloc: std.mem.Allocator, images: []types.ImageAttachment) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = if (ctx.state.active_session) |*value| value else return;
@@ -3079,6 +3124,12 @@ fn persistAcpHistoryTurn(
     current_prompt_input: ?*ParsedPromptInput,
     hand_back_alloc: ?Allocator,
 ) !void {
+    // The repository as the turn left it, captured before the write lock.
+    // An earlier turn committed as the next prompt starts still holds its
+    // own token: the next turn's starts later (D98).
+    if (comptime turn_capture.supported) {
+        if (workspaceCaptureContext(session)) |context| session.turn_capture.end(context, &session.session_write_mutex);
+    }
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
     var prepared = try session.session_rt.prepareHistoryEntry(alloc, turn);
@@ -3100,11 +3151,17 @@ fn persistAcpHistoryTurn(
     }
     if (session.v2) |v2| {
         try v2.prepareTurn(&prepared);
-        v2.commitTurn(prepared, session.session_rt.languageSnapshot()) catch |err| {
+        const capture_token = session.turn_capture.token();
+        const committed = if (capture_token) |token|
+            v2.commitTurnWithCaptures(prepared, session.session_rt.languageSnapshot(), token)
+        else
+            v2.commitTurn(prepared, session.session_rt.languageSnapshot());
+        committed catch |err| {
             // A failed write may still have reached the log: keep its images.
             if (session_adapter.writeMayHaveLanded(err)) if (current_prompt_input) |input| input.retainImageSnapshots();
             return err;
         };
+        session.turn_capture.committed(capture_token);
         session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
         prepared_owned = false;
         if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();

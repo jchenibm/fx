@@ -1910,6 +1910,42 @@ as it was sent):
     `turn_interrupted`, counts for nothing. In every other turn it takes
     the newest capture for each repository and phase.
   - **Older fx:** an fx from before D98 leaves the item out (D17).
+  - **Callers:** `fx ask`, every app instance and ACP capture the
+    repository holding the session's folder at each turn's start and end
+    while the profile setting `experimental.workspace_capture` is on
+    (`src/core/workspace/turn_capture.zig`). A subagent captures its own
+    turns into its own session, so captures of work it does after its
+    parent's turn are still its turns': through its own agent in the app,
+    through `execution.TurnContext` in `fx ask` and ACP. The libfx
+    WebAssembly builds do not capture. Before an admitted tool acts in
+    another repository, the turn takes that repository's start capture,
+    with the tool in `trigger_tool`, and its end capture closes the turn
+    with the others.
+  - **Host order:** the runtime begins the turn's token, then saves the
+    user's prompt through `append_turn_piece`, then takes the start
+    capture, all before the first request. The prompt's write opens the
+    turn for the token, so the start capture is written in it at once, and
+    a process killed during the capture, which can take seconds, keeps the
+    prompt. The end capture runs on the turn's own thread before the
+    commit. In the app that is the agent's worker, as the turn finishes and
+    before its finished prompt reaches the UI, so the UI's commit, which
+    may run late in the pacer, only writes what is held. A host commits
+    with the token only once the turn's end capture is taken; a commit of
+    an earlier turn after the next turn has begun uses no token.
+  - **Reached repositories:** a turn captures at most 8 repositories
+    besides the session's own. Parallel tool calls that reach different
+    repositories capture at the same time; a call that reaches one whose
+    start capture is still running waits until it is saved. A repository
+    whose worktree root is `/`, the home folder (`$HOME` or the session
+    store's home), or an ancestor of it is never captured, so a home
+    folder kept as a dotfiles repository stays out of fx's store; the
+    trace records the skip. The worktree root is found as the footer's
+    branch is (`src/core/workspace/repo_root.zig`): a `.git` that is a
+    symlink or not a directory or gitdir file means no repository.
+  - **Fork:** while captures are on, a fork gives the fork's id, and each
+    copied subagent's copy, the source's capture refs
+    (`capture_store.copySessionRefs`), so retention keeps the captures the
+    fork's log names after the source's are evicted.
 
   **Why:** a capture belongs to its turn: it must survive a resume and a
   fork with it and never move the turn's streamed prefix. A start written

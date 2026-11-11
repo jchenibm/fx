@@ -364,6 +364,29 @@ pub const Store = struct {
         return try alloc.dupe(u8, try json_decode.parseFromSliceLeaky([]const u8, scratch.allocator(), raw, .{}));
     }
 
+    /// Every saved session's id, children included, owned by `arena`; null
+    /// when the catalog cannot be read. Capture retention matches sessions
+    /// to their capture refs with it (D98).
+    pub fn sessionIds(store: *Store, arena: Allocator) ?[]const []const u8 {
+        var ids: std.ArrayList([]const u8) = .empty;
+        var cursor: ?sm.ListCursor = null;
+        while (true) {
+            var page = store.manager.list(arena, .all, cursor, 512) catch return null;
+            defer page.deinit();
+            for (page.items) |item| {
+                const id = arena.dupe(u8, item.id) catch return null;
+                ids.append(arena, id) catch return null;
+            }
+            cursor = page.next orelse break;
+        }
+        return ids.items;
+    }
+
+    /// Whether another process has session `id` open; true when unsure.
+    pub fn sessionBusy(store: *Store, id: []const u8) bool {
+        return store.manager.isBusy(id) catch true;
+    }
+
     /// A child's whole history, read without its lock: every turn, oldest
     /// first. Free with `types.freeHistoryTurnSlice`.
     pub fn childHistory(store: *Store, alloc: Allocator, child_id: []const u8) ![]types.HistoryTurn {

@@ -31,6 +31,7 @@ const session_codec = @import("../core/session/session_codec.zig");
 const session_log = @import("../core/session/session_log.zig");
 const session_store = @import("../core/session/session_store.zig");
 const session_adapter = @import("../core/session/session_adapter.zig");
+const turn_capture = @import("../core/workspace/turn_capture.zig");
 const session_runtime = @import("../core/session/session.zig");
 const session_title_generation = @import("../core/session/session_title_generation.zig");
 const worker_runtime = @import("../core/agent/worker_runtime.zig");
@@ -228,6 +229,11 @@ pub const ActiveSessionState = struct {
     session_id: []u8,
     /// The saved session; null on the wasm host, which keeps `wasm_state`.
     v2: ?*session_adapter.Session = null,
+    /// The home of the session store while workspace captures are on, set
+    /// as each prompt starts; null when they are off (D98).
+    capture_home: ?[]const u8 = null,
+    /// The current turn's workspace captures.
+    turn_capture: turn_capture.TurnCapture = .{},
     wasm_state: ?session_codec.DurableSessionState = null,
     wasm_revision: ?[]u8 = null,
     session_write_mutex: std.Io.Mutex = .init,
@@ -353,6 +359,8 @@ pub const ServerState = struct {
     context_enabled: bool = true,
     session_titles: bool = true,
     cache_warming: bool = true,
+    /// `experimental.workspace_capture`, from startup.
+    workspace_capture: bool = false,
     active_session: ?ActiveSessionState = null,
     active_prompt: ?*ActivePrompt = null,
     subagent_authority_mutex: std.Io.Mutex = .init,
@@ -3017,6 +3025,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.context_enabled = startup.context_enabled;
     state.session_titles = startup.session_title_generation;
     state.cache_warming = startup.cache_warming;
+    state.workspace_capture = startup.workspace_capture;
 
     if (comptime !host_target.is_wasm) {
         if (!state.cfg.minimal_kernel) {
